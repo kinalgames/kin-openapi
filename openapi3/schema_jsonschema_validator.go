@@ -5,7 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"runtime"
 	"strings"
+	"sync"
+	"weak"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
 )
@@ -15,6 +18,12 @@ type jsonSchemaValidator struct {
 	compiler *jsonschema.Compiler
 	schema   *jsonschema.Schema
 }
+
+// compiledJSONSchemas holds the compiled JSON Schema 2020-12 validator of each schema validated
+// without per-validation formats. Compiling marshals the schema and builds a compiler, far more
+// work than checking a value, and it gives the same validator for a schema that does not change.
+// The keys are weak: a schema that becomes unreachable takes its entry with it.
+var compiledJSONSchemas sync.Map // weak.Pointer[Schema] -> *jsonSchemaValidator
 
 // newJSONSchemaValidator creates a new validator using JSON Schema 2020-12
 func newJSONSchemaValidator(schema *Schema, settings *schemaValidationSettings) (*jsonSchemaValidator, error) {
@@ -288,11 +297,36 @@ func formatValidationError(verr *jsonschema.ValidationError, parentPath string) 
 
 // useJSONSchema2020 validates using the JSON Schema 2020-12 validator
 func (schema *Schema) useJSONSchema2020(settings *schemaValidationSettings, value any) error {
-	validator, err := newJSONSchemaValidator(schema, settings)
+	validator, err := schema.jsonSchemaValidator(settings)
 	if err != nil {
 		// Fall back to built-in validator if compilation fails
 		return schema.visitJSON(settings, value)
 	}
 
 	return validator.validate(value)
+}
+
+// jsonSchemaValidator returns the schema's JSON Schema 2020-12 validator. Validation settings that
+// carry per-validation formats compile a validator for the call, since its format checks read
+// them. Otherwise the schema is compiled once and its validator kept while the schema is
+// reachable, compiled with empty settings so that it holds none of the caller's; its format checks
+// then read the package's formats at each validation, as a validator compiled for the call does.
+// A schema changed after its first validation keeps the validator of what it was.
+func (schema *Schema) jsonSchemaValidator(settings *schemaValidationSettings) (*jsonSchemaValidator, error) {
+	if len(settings.stringFormats) > 0 || len(settings.numberFormats) > 0 || len(settings.integerFormats) > 0 {
+		return newJSONSchemaValidator(schema, settings)
+	}
+	key := weak.Make(schema)
+	if cached, ok := compiledJSONSchemas.Load(key); ok {
+		return cached.(*jsonSchemaValidator), nil
+	}
+	validator, err := newJSONSchemaValidator(schema, &schemaValidationSettings{})
+	if err != nil {
+		return nil, err
+	}
+	if cached, loaded := compiledJSONSchemas.LoadOrStore(key, validator); loaded {
+		return cached.(*jsonSchemaValidator), nil
+	}
+	runtime.AddCleanup(schema, func(key weak.Pointer[Schema]) { compiledJSONSchemas.Delete(key) }, key)
+	return validator, nil
 }
