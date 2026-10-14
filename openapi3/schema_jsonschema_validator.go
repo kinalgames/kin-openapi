@@ -19,11 +19,18 @@ type jsonSchemaValidator struct {
 	schema   *jsonschema.Schema
 }
 
-// compiledJSONSchemas holds the compiled JSON Schema 2020-12 validator of each schema validated
-// without per-validation formats. Compiling marshals the schema and builds a compiler, far more
-// work than checking a value, and it gives the same validator for a schema that does not change.
-// The keys are weak: a schema that becomes unreachable takes its entry with it.
-var compiledJSONSchemas sync.Map // weak.Pointer[Schema] -> *jsonSchemaValidator
+// compiledJSONSchemas holds the outcome of compiling the JSON Schema 2020-12 validator of each
+// schema validated without per-validation formats: the validator, or the compiler's refusal.
+// Compiling marshals the schema and builds a compiler, far more work than checking a value, and it
+// gives the same outcome for a schema that does not change, a refusal included. The keys are weak:
+// a schema that becomes unreachable takes its entry with it.
+var compiledJSONSchemas sync.Map // weak.Pointer[Schema] -> *compiledJSONSchema
+
+// compiledJSONSchema is the outcome of compiling a schema's JSON Schema 2020-12 validator.
+type compiledJSONSchema struct {
+	validator *jsonSchemaValidator
+	err       error
+}
 
 // newJSONSchemaValidator creates a new validator using JSON Schema 2020-12
 func newJSONSchemaValidator(schema *Schema, settings *schemaValidationSettings) (*jsonSchemaValidator, error) {
@@ -306,27 +313,29 @@ func (schema *Schema) useJSONSchema2020(settings *schemaValidationSettings, valu
 	return validator.validate(value)
 }
 
-// jsonSchemaValidator returns the schema's JSON Schema 2020-12 validator. Validation settings that
-// carry per-validation formats compile a validator for the call, since its format checks read
-// them. Otherwise the schema is compiled once and its validator kept while the schema is
-// reachable, compiled with empty settings so that it holds none of the caller's; its format checks
-// then read the package's formats at each validation, as a validator compiled for the call does.
-// A schema changed after its first validation keeps the validator of what it was.
+// jsonSchemaValidator returns the schema's JSON Schema 2020-12 validator, or the compiler's refusal.
+// Validation settings that carry per-validation formats compile a validator for the call, since its
+// format checks read them. Otherwise the schema is compiled once and the outcome kept while the
+// schema is reachable, a refusal as well as a validator, so a schema the compiler refuses is not
+// compiled again on every validation; the validator is compiled with empty settings so that it
+// holds none of the caller's, and its format checks read the package's formats at each validation,
+// as a validator compiled for the call does. A schema changed after its first validation keeps the
+// outcome of what it was.
 func (schema *Schema) jsonSchemaValidator(settings *schemaValidationSettings) (*jsonSchemaValidator, error) {
 	if len(settings.stringFormats) > 0 || len(settings.numberFormats) > 0 || len(settings.integerFormats) > 0 {
 		return newJSONSchemaValidator(schema, settings)
 	}
 	key := weak.Make(schema)
 	if cached, ok := compiledJSONSchemas.Load(key); ok {
-		return cached.(*jsonSchemaValidator), nil
+		c := cached.(*compiledJSONSchema)
+		return c.validator, c.err
 	}
 	validator, err := newJSONSchemaValidator(schema, &schemaValidationSettings{})
-	if err != nil {
-		return nil, err
-	}
-	if cached, loaded := compiledJSONSchemas.LoadOrStore(key, validator); loaded {
-		return cached.(*jsonSchemaValidator), nil
+	c := &compiledJSONSchema{validator: validator, err: err}
+	if cached, loaded := compiledJSONSchemas.LoadOrStore(key, c); loaded {
+		c = cached.(*compiledJSONSchema)
+		return c.validator, c.err
 	}
 	runtime.AddCleanup(schema, func(key weak.Pointer[Schema]) { compiledJSONSchemas.Delete(key) }, key)
-	return validator, nil
+	return validator, err
 }

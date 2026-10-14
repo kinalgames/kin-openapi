@@ -11,13 +11,22 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// compiled is the validator the cache holds for schema, if any.
+// compiled is the validator the cache holds for schema, if it holds one.
 func compiled(schema *Schema) (*jsonSchemaValidator, bool) {
 	cached, ok := compiledJSONSchemas.Load(weak.Make(schema))
-	if !ok {
+	if !ok || cached.(*compiledJSONSchema).validator == nil {
 		return nil, false
 	}
-	return cached.(*jsonSchemaValidator), true
+	return cached.(*compiledJSONSchema).validator, true
+}
+
+// refused is the compiler's refusal the cache holds for schema, if it holds one.
+func refused(schema *Schema) (error, bool) {
+	cached, ok := compiledJSONSchemas.Load(weak.Make(schema))
+	if !ok || cached.(*compiledJSONSchema).err == nil {
+		return nil, false
+	}
+	return cached.(*compiledJSONSchema).err, true
 }
 
 func TestJSONSchema2020ValidatorIsCompiledOncePerSchema(t *testing.T) {
